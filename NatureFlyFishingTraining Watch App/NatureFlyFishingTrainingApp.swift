@@ -1,17 +1,13 @@
-//
-//  NatureFlyFishingTrainingApp.swift
-//  NatureFlyFishingTraining Watch App
-//
-//  Created by Sergio Sancristán Santero on 16/04/2026.
-//
-
 import SwiftUI
 
 @main
 struct NatureFlyFishingTraining_Watch_AppApp: App {
+    @StateObject private var viewModel = WorkoutViewModel()
+
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .environmentObject(viewModel)
         }
     }
 }

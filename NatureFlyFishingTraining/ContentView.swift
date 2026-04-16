@@ -1,24 +1,21 @@
-//
-//  ContentView.swift
-//  NatureFlyFishingTraining
-//
-//  Created by Sergio Sancristán Santero on 16/04/2026.
-//
-
 import SwiftUI
 
 struct ContentView: View {
-    var body: some View {
-        VStack {
-            Image(systemName: "globe")
-                .imageScale(.large)
-                .foregroundStyle(.tint)
-            Text("Hello, world!")
-        }
-        .padding()
-    }
-}
+    @EnvironmentObject var viewModel: WorkoutViewModel
 
-#Preview {
-    ContentView()
+    var body: some View {
+        NavigationStack {
+            Group {
+                switch viewModel.workoutState {
+                case .idle:
+                    SetupView()
+                case .running, .paused:
+                    WorkoutView()
+                case .finished:
+                    SummaryView()
+                }
+            }
+            .animation(.easeInOut(duration: 0.3), value: viewModel.workoutState)
+        }
+    }
 }
