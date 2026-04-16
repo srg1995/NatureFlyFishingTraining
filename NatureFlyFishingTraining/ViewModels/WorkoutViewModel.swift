@@ -1,6 +1,5 @@
 import Foundation
 import Combine
-import WatchKit
 
 // MARK: - ViewModel
 
@@ -92,7 +91,6 @@ final class WorkoutViewModel: ObservableObject {
         }
 
         workoutState = .running
-        WKInterfaceDevice.current().play(.start)
         scheduleTimer()
     }
 
@@ -102,7 +100,6 @@ final class WorkoutViewModel: ObservableObject {
         timer     = nil
         pauseDate = Date()
         workoutState = .paused
-        WKInterfaceDevice.current().play(.stop)
     }
 
     func resetWorkout() {
@@ -178,7 +175,6 @@ final class WorkoutViewModel: ObservableObject {
 
         lastSession  = session
         workoutState = .finished
-        WKInterfaceDevice.current().play(.success)
 
         WorkoutHistoryStore.shared.add(session)
         syncWorkout(session: session)
@@ -203,7 +199,7 @@ final class WorkoutViewModel: ObservableObject {
     }
 
     private func haptic() {
-        WKInterfaceDevice.current().play(.click)
+        // Haptic feedback only available on Watch
     }
 
     private func formatted(_ time: TimeInterval) -> String {

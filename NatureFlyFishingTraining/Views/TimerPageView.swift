@@ -44,7 +44,7 @@ struct TimerPageView: View {
 
                 // START / PAUSE
                 VStack(spacing: 4) {
-                    Button(action: isRunning ? viewModel.pauseWorkout : viewModel.startWorkout) {
+                    Button(action: { isRunning ? viewModel.pauseWorkout() : viewModel.startWorkout() }) {
                         Image(systemName: isRunning ? "pause.fill" : "play.fill")
                             .font(.system(size: 18, weight: .semibold))
                             .frame(maxWidth: .infinity)

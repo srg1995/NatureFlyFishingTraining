@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 import WatchConnectivity
 
 @MainActor
@@ -70,15 +71,6 @@ final class WatchConnectivityManager: NSObject, ObservableObject, WCSessionDeleg
 
     func session(_ session: WCSession, activationDidCompleteWith activationState: WCSessionActivationState, error: Error?) {
         print("[WatchConnectivity] Sesión activada: \(activationState.rawValue)")
-    }
-
-    func sessionDidBecomeInactive(_ session: WCSession) {
-        print("[WatchConnectivity] Sesión inactiva")
-    }
-
-    func sessionDidDeactivate(_ session: WCSession) {
-        print("[WatchConnectivity] Sesión desactivada")
-        setupSession()
     }
 
     func session(_ session: WCSession, didReceiveMessage message: [String : Any]) {
