@@ -7,9 +7,9 @@ struct WorkoutView: View {
     var body: some View {
         TabView(selection: $selectedPage) {
             TimerPageView()
-                .tag(0)
-            CountersPageView()
                 .tag(1)
+            CountersPageView()
+                .tag(0)
         }
         .tabViewStyle(.page)
     }

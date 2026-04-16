@@ -1,7 +1,10 @@
 import Foundation
+import Combine
 import HealthKit
 
 class HealthKitService: NSObject, ObservableObject {
+
+    @Published var isActive = false
 
     private let healthStore = HKHealthStore()
     private var workoutSession: HKWorkoutSession?
