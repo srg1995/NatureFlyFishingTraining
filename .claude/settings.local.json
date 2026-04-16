@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git remote:*)",
+      "Bash(git commit -m 'Add watch app icon assets:*)",
+      "Bash(git push:*)",
+      "Bash(gh repo:*)"
+    ]
+  }
+}
