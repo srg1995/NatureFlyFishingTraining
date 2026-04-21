@@ -2,162 +2,124 @@ import Foundation
 import Combine
 import HealthKit
 
-class HealthKitService: NSObject, ObservableObject {
+/// Gestor HealthKit para iPhone.
+///
+/// En esta arquitectura el Watch es el dueño de las sesiones en vivo (`HKLiveWorkoutBuilder`).
+/// El iPhone sólo graba un workout directamente si la sesión se completó sin Watch
+/// disponible (usando `HKWorkoutBuilder` no-live con muestras estimadas).
+@MainActor
+final class HealthKitService: NSObject, ObservableObject {
 
-    @Published var isActive = false
+    static let shared = HealthKitService()
 
-    private let healthStore = HKHealthStore()
-    private var workoutSession: HKWorkoutSession?
-    private var liveBuilder:    HKLiveWorkoutBuilder?
+    @Published private(set) var isAuthorized = false
 
-    // MARK: - Tipos requeridos
+    private let store = HKHealthStore()
+
+    // MARK: - Tipos
 
     private var shareTypes: Set<HKSampleType> {
-        var types: Set<HKSampleType> = [
-            HKObjectType.workoutType()
-        ]
-        if let energy = HKObjectType.quantityType(forIdentifier: .activeEnergyBurned) {
-            types.insert(energy)
-        }
-        if let heart = HKObjectType.quantityType(forIdentifier: .heartRate) {
-            types.insert(heart)
-        }
+        var types: Set<HKSampleType> = [.workoutType()]
+        if let e = HKQuantityType.quantityType(forIdentifier: .activeEnergyBurned) { types.insert(e) }
         return types
     }
 
     private var readTypes: Set<HKObjectType> {
-        [HKObjectType.workoutType()]
+        var types: Set<HKObjectType> = [.workoutType()]
+        if let e = HKQuantityType.quantityType(forIdentifier: .activeEnergyBurned) { types.insert(e) }
+        if let h = HKQuantityType.quantityType(forIdentifier: .heartRate)          { types.insert(h) }
+        return types
     }
 
     // MARK: - Permisos
 
-    func requestPermissions(completion: @escaping (Bool, Error?) -> Void) {
-        guard HKHealthStore.isHealthDataAvailable() else {
-            completion(false, nil)
-            return
-        }
-        healthStore.requestAuthorization(toShare: shareTypes, read: readTypes) { success, error in
-            DispatchQueue.main.async { completion(success, error) }
-        }
+    func requestAuthorization() async throws {
+        guard HKHealthStore.isHealthDataAvailable() else { return }
+        try await store.requestAuthorization(toShare: shareTypes, read: readTypes)
+        isAuthorized = true
     }
 
-    // MARK: - Inicio de sesión
+    // MARK: - Guardado directo desde iPhone
 
-    func startSession(startDate: Date) {
+    /// Guarda un `WorkoutSession` en HealthKit usando `HKWorkoutBuilder` no-live.
+    /// Úsalo únicamente si NO hay Watch grabando la misma sesión (usa `existingWorkoutMatches`
+    /// para asegurar idempotencia).
+    @discardableResult
+    func saveWorkoutFromPhone(_ workout: WorkoutSession) async throws -> UUID? {
         let config = HKWorkoutConfiguration()
-        config.activityType  = .other
-        config.locationType  = .outdoor
+        if #available(iOS 17.0, *) {
+            config.activityType = .fishing
+        } else {
+            config.activityType = .other
+        }
+        config.locationType = .outdoor
 
-        do {
-            let session = try HKWorkoutSession(healthStore: healthStore, configuration: config)
-            session.delegate = self
+        let builder = HKWorkoutBuilder(healthStore: store,
+                                       configuration: config,
+                                       device: .local())
 
-            let builder = session.associatedWorkoutBuilder()
-            builder.delegate   = self
-            builder.dataSource = HKLiveWorkoutDataSource(
-                healthStore:            healthStore,
-                workoutConfiguration:   config
+        try await builder.beginCollection(at: workout.startDate)
+
+        // Calorías activas estimadas: ~3.5 kcal/min para actividad ligera de pie.
+        if let energyType = HKQuantityType.quantityType(forIdentifier: .activeEnergyBurned) {
+            let kcal = max(1, workout.duration / 60 * 3.5)
+            let sample = HKQuantitySample(
+                type: energyType,
+                quantity: HKQuantity(unit: .kilocalorie(), doubleValue: kcal),
+                start: workout.startDate,
+                end: workout.endDate
             )
+            try await builder.addSamples([sample])
+        }
 
-            workoutSession = session
-            liveBuilder    = builder
+        try await builder.addMetadata([
+            HKMetadataKeyWorkoutBrandName: "Nature Fly Fishing",
+            "PecesT":     workout.pecesT,
+            "PecesM":     workout.pecesM,
+            "TotalPeces": workout.totalPeces,
+            "Modo":       workout.mode.rawValue,
+            "Origen":     "iPhone"
+        ])
 
-            session.startActivity(with: startDate)
-            builder.beginCollection(withStart: startDate) { _, _ in }
+        try await builder.endCollection(at: workout.endDate)
+        let saved = try await builder.finishWorkout()
+        return saved?.uuid
+    }
 
-        } catch {
-            print("[HealthKit] Error al iniciar sesión: \(error.localizedDescription)")
+    /// Comprueba si ya existe un workout en HealthKit en la ventana temporal de la sesión
+    /// (±30s sobre el inicio). Evita duplicados si el Watch ya lo grabó.
+    func existingWorkoutMatches(_ workout: WorkoutSession) async -> Bool {
+        let window: TimeInterval = 30
+        let predicate = HKQuery.predicateForSamples(
+            withStart: workout.startDate.addingTimeInterval(-window),
+            end:       workout.startDate.addingTimeInterval(window),
+            options: []
+        )
+        return await withCheckedContinuation { cont in
+            let query = HKSampleQuery(
+                sampleType: .workoutType(),
+                predicate: predicate,
+                limit: 1,
+                sortDescriptors: nil
+            ) { _, samples, _ in
+                cont.resume(returning: (samples?.isEmpty == false))
+            }
+            store.execute(query)
         }
     }
 
-    // MARK: - Fin de sesión
+    // MARK: - Compatibilidad con ViewModel existente
 
-    func endSession(session: WorkoutSession, completion: @escaping (Bool, Error?) -> Void) {
-        workoutSession?.end()
-
-        // 1. Añadir muestra de calorías activas estimadas
-        addEnergySample(session: session) { [weak self] in
-            guard let self else { return }
-
-            // 2. Cerrar la recolección
-            self.liveBuilder?.endCollection(withEnd: session.endDate) { success, error in
-                guard success else {
-                    DispatchQueue.main.async { completion(false, error) }
-                    return
-                }
-
-                // 3. Añadir metadata con los datos de pesca
-                let metadata = self.buildMetadata(session: session)
-                self.liveBuilder?.addMetadata(metadata) { _, _ in
-
-                    // 4. Finalizar y guardar el workout en HealthKit
-                    self.liveBuilder?.finishWorkout { workout, error in
-                        DispatchQueue.main.async {
-                            if let workout {
-                                print("[HealthKit] ✅ Workout guardado: \(workout.uuid)")
-                            } else {
-                                print("[HealthKit] ❌ Error: \(error?.localizedDescription ?? "desconocido")")
-                            }
-                            completion(workout != nil, error)
-                        }
-                    }
-                }
+    /// Se conserva la firma antigua como no-op en iPhone: la grabación HealthKit
+    /// desde iPhone pasa a hacerse a través de `saveWorkoutFromPhone` tras completar.
+    func requestPermissions(completion: @escaping (Bool, Error?) -> Void) {
+        Task {
+            do {
+                try await requestAuthorization()
+                completion(true, nil)
+            } catch {
+                completion(false, error)
             }
         }
     }
-
-    // MARK: - Helpers privados
-
-    private func addEnergySample(session: WorkoutSession, completion: @escaping () -> Void) {
-        guard let energyType = HKObjectType.quantityType(forIdentifier: .activeEnergyBurned) else {
-            completion()
-            return
-        }
-
-        // Estimación: ~3.5 kcal/min para actividad ligera de pie (pesca)
-        let minutes  = session.duration / 60
-        let calories = max(1, minutes * 3.5)
-        let quantity = HKQuantity(unit: .kilocalorie(), doubleValue: calories)
-        let sample   = HKQuantitySample(
-            type:     energyType,
-            quantity: quantity,
-            start:    session.startDate,
-            end:      session.endDate
-        )
-
-        liveBuilder?.add([sample]) { _, _ in completion() }
-    }
-
-    private func buildMetadata(session: WorkoutSession) -> [String: Any] {
-        [
-            HKMetadataKeyWorkoutBrandName: "Nature Fly Fishing Competition",
-            "Peces T":     session.pecesT,
-            "Peces M":     session.pecesM,
-            "Total Peces": session.totalPeces,
-            "Modo":        session.mode.rawValue
-        ]
-    }
-}
-
-// MARK: - HKWorkoutSessionDelegate
-
-extension HealthKitService: HKWorkoutSessionDelegate {
-    func workoutSession(_ workoutSession: HKWorkoutSession,
-                        didChangeTo toState: HKWorkoutSessionState,
-                        from fromState: HKWorkoutSessionState,
-                        date: Date) {
-        print("[HealthKit] Estado: \(fromState.rawValue) → \(toState.rawValue)")
-    }
-
-    func workoutSession(_ workoutSession: HKWorkoutSession, didFailWithError error: Error) {
-        print("[HealthKit] Sesión fallida: \(error.localizedDescription)")
-    }
-}
-
-// MARK: - HKLiveWorkoutBuilderDelegate
-
-extension HealthKitService: HKLiveWorkoutBuilderDelegate {
-    func workoutBuilderDidCollectEvent(_ workoutBuilder: HKLiveWorkoutBuilder) {}
-    func workoutBuilder(_ workoutBuilder: HKLiveWorkoutBuilder,
-                        didCollectDataOf collectedTypes: Set<HKSampleType>) {}
 }

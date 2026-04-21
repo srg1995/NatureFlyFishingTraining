@@ -2,7 +2,7 @@ import Foundation
 import Combine
 import WatchKit
 
-// MARK: - ViewModel
+// MARK: - ViewModel (Watch)
 
 @MainActor
 final class WorkoutViewModel: ObservableObject {
@@ -10,20 +10,16 @@ final class WorkoutViewModel: ObservableObject {
     // MARK: - Published State
 
     @Published var workoutState: WorkoutState = .idle
-    @Published var workoutMode: WorkoutMode   = .timed
+    @Published var workoutMode:  WorkoutMode  = .timed
 
-    // Configuración del timer (modo timed) — minutos totales, de 10 en 10 hasta 120, defecto 60
     @Published var selectedDuration: Int = 60
 
-    // Tiempo restante (modo timed) / transcurrido (modo libre)
     @Published var remainingTime: TimeInterval = 3600
     @Published var elapsedTime:   TimeInterval = 0
 
-    // Contadores
     @Published var pecesT: Int = 0
     @Published var pecesM: Int = 0
 
-    // Post-workout
     @Published var lastSession:    WorkoutSession?
     @Published var isSyncing:      Bool = false
     @Published var healthKitSaved: Bool = false
@@ -32,8 +28,9 @@ final class WorkoutViewModel: ObservableObject {
 
     // MARK: - Private
 
-    private let healthKit = HealthKitService()
-    private let strava    = StravaService()
+    private let healthKit     = HealthKitService.shared
+    private let strava        = StravaService.shared
+    private let connectivity  = WatchConnectivityManager.shared
 
     private var startDate:        Date?
     private var pauseDate:        Date?
@@ -46,7 +43,6 @@ final class WorkoutViewModel: ObservableObject {
 
     // MARK: - Computed
 
-    /// Tiempo que se muestra en pantalla según el modo
     var formattedDisplay: String {
         switch workoutMode {
         case .timed: return formatted(remainingTime)
@@ -54,7 +50,10 @@ final class WorkoutViewModel: ObservableObject {
         }
     }
 
-    var stravaAuthenticated: Bool { strava.isAuthenticated }
+    /// En el Watch refleja si el iPhone ha autenticado Strava.
+    var stravaAuthenticated: Bool {
+        strava.isAuthenticated || connectivity.stravaConnectedOnPhone
+    }
 
     // MARK: - Mode
 
@@ -80,20 +79,25 @@ final class WorkoutViewModel: ObservableObject {
             healthKitSaved   = false
             stravaSaved      = false
 
-            healthKit.requestPermissions { [weak self] success, _ in
-                guard let self, success, let start = self.startDate else { return }
-                self.healthKit.startSession(startDate: start)
+            // Permisos + sesión HealthKit en vivo
+            Task {
+                try? await healthKit.requestAuthorization()
+                if let start = self.startDate {
+                    healthKit.startSession(startDate: start)
+                }
             }
         }
 
         if workoutState == .paused, let pd = pauseDate {
             accumulatedPause += Date().timeIntervalSince(pd)
             pauseDate = nil
+            healthKit.resume()
         }
 
         workoutState = .running
         WKInterfaceDevice.current().play(.start)
         scheduleTimer()
+        broadcastLiveState()
     }
 
     func pauseWorkout() {
@@ -102,7 +106,9 @@ final class WorkoutViewModel: ObservableObject {
         timer     = nil
         pauseDate = Date()
         workoutState = .paused
+        healthKit.pause()
         WKInterfaceDevice.current().play(.stop)
+        broadcastLiveState()
     }
 
     func resetWorkout() {
@@ -117,6 +123,7 @@ final class WorkoutViewModel: ObservableObject {
         pecesT           = 0
         pecesM           = 0
         syncError        = nil
+        broadcastLiveState()
     }
 
     func finishManually() {
@@ -125,10 +132,10 @@ final class WorkoutViewModel: ObservableObject {
 
     // MARK: - Counters
 
-    func incrementPecesT() { pecesT += 1; haptic() }
-    func decrementPecesT() { if pecesT > 0 { pecesT -= 1; haptic() } }
-    func incrementPecesM() { pecesM += 1; haptic() }
-    func decrementPecesM() { if pecesM > 0 { pecesM -= 1; haptic() } }
+    func incrementPecesT() { pecesT += 1; haptic(); broadcastLiveState() }
+    func decrementPecesT() { if pecesT > 0 { pecesT -= 1; haptic(); broadcastLiveState() } }
+    func incrementPecesM() { pecesM += 1; haptic(); broadcastLiveState() }
+    func decrementPecesM() { if pecesM > 0 { pecesM -= 1; haptic(); broadcastLiveState() } }
 
     // MARK: - Private
 
@@ -154,8 +161,10 @@ final class WorkoutViewModel: ObservableObject {
                 completeWorkout()
             }
         case .free:
-            break // Sin fin automático — el usuario pulsa la bandera
+            break
         }
+
+        broadcastLiveState()
     }
 
     private func completeWorkout() {
@@ -181,25 +190,45 @@ final class WorkoutViewModel: ObservableObject {
         WKInterfaceDevice.current().play(.success)
 
         WorkoutHistoryStore.shared.add(session)
-        syncWorkout(session: session)
-    }
 
-    private func syncWorkout(session: WorkoutSession) {
-        isSyncing = true
-
-        healthKit.endSession(session: session) { [weak self] success, _ in
-            Task { @MainActor [weak self] in self?.healthKitSaved = success }
-        }
-
+        // Cerrar HealthKit (fuente única de grabación) y propagar al iPhone.
         Task {
+            isSyncing = true
+
             do {
-                try await strava.uploadActivity(session: session)
-                stravaSaved = true
+                _ = try await healthKit.endSession(for: session)
+                healthKitSaved = true
             } catch {
+                healthKitSaved = false
                 syncError = error.localizedDescription
             }
+
+            // Envío garantizado al iPhone — él sube a Strava.
+            connectivity.sendCompletedSession(session)
+
             isSyncing = false
         }
+    }
+
+    private func broadcastLiveState() {
+        let stateStr: String = {
+            switch workoutState {
+            case .idle:     return "idle"
+            case .running:  return "running"
+            case .paused:   return "paused"
+            case .finished: return "finished"
+            }
+        }()
+        connectivity.sendLiveState(
+            LiveWorkoutState(
+                state:         stateStr,
+                mode:          workoutMode.rawValue,
+                pecesT:        pecesT,
+                pecesM:        pecesM,
+                elapsedTime:   elapsedTime,
+                remainingTime: remainingTime
+            )
+        )
     }
 
     private func haptic() {
